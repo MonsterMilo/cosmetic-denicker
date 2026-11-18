@@ -883,7 +883,7 @@ function X.over(g)
         end
         for _, r in ipairs(s.rides) do
             local ride = D.DANCE_RIDES[r.type]
-            if ride and s.winners[lower(r.rider)] then call(r.rider, ride.ids, ride.confirmed and nil or "not seen in a real game yet") end
+            if ride and s.winners[lower(r.rider)] then call(r.rider, ride.ids, (not ride.confirmed) and "not seen in a real game yet" or nil) end
         end
         for _, sign in ipairs(D.DANCE_SIGNS) do
             local near = {}
@@ -1037,8 +1037,9 @@ starfish.events.on("entity:attach", function(e)
     if not g or not g.overAt or not e.vehicle or e.leash then return end
     local rider = e.entity and e.entity.uuid and nameOfUuid(g, e.entity.uuid)
     if not rider then return end
-    local vehicle = type(e.vehicle) == "table" and e.vehicle or starfish.entities.byId(e.vehicle)
-    local typ, k = mobType(vehicle and vehicle.kind)
+    local vid = type(e.vehicle) == "table" and e.vehicle.entityId or e.vehicle
+    local vkind = (type(e.vehicle) == "table" and e.vehicle.kind) or C.kindOfId(vid)
+    local typ, k = mobType(vkind)
     local key = typ or (k and k:find("minecart") and "object") or nil
     if key then S(g).rides[#S(g).rides + 1] = { rider = rider, type = key } end
 end)
