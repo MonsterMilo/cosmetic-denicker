@@ -3,7 +3,7 @@ plugin = {
     displayName = "Cosmetic Denicker",
     command = "cd",
     prefix = "§dCD",
-    version = "0.1.1",
+    version = "0.1.2",
     minStarfishVersion = "0.1.0-beta.19",
     description = "Beta. Spots nicked players' cosmetics and finds who they are after the game",
     readme = [[
@@ -26,6 +26,43 @@ Unresolved nicks stay in `/cd saved` until found or removed. Removing one also u
 }
 
 local D = require("data")
+
+-- Looks seen in Starfish games that the generated data lacks.
+for _, s in ipairs({
+    { ids = { "beddestroy_pig_missile" }, min = { ["sound:random.pop"] = 12, ["mob:pig"] = 1 }, kind = "bed", confirmed = true },
+    { ids = { "killeffect_cow_rocket" }, min = { ["sound:random.pop"] = 8, ["mob:cow"] = 1 }, kind = "kill", confirmed = true },
+}) do table.insert(D.FX_SIGNS, s) end
+-- (Starfish leaves out the block of blockdust particles, so the bare name counts.)
+table.insert(D.TRAIL_SIGNS, { ids = { "projectiletrail_blood" }, min = { blockdust = 30 }, confirmed = true })
+
+-- Mobs (and lightning, "L") that kill effects and bed destroys spawn where
+-- they play, keyed by 1.8 mob id. A sign that fits wins; this is next.
+-- maybe: why it's only a guess. adultOnly: babies mean something else.
+-- babyIds: only babies. manyIds/manyAt: that many grown at once.
+-- unnamedOnly: a named mob (a bought Dream Defender) doesn't count.
+local FX_MOBS = {
+    kill = {
+        [92] = { ids = { "killeffect_cow_rocket" } },
+        [90] = { ids = { "killeffect_pigsmash" }, adultOnly = true, maybe = "a pig with no hearts seen - Pig Smash shows hearts too" },
+        [94] = { ids = { "killeffect_squid_missile" } },
+        [68] = { ids = { "killeffect_guardian_rocket" } },
+        [101] = { ids = { "killeffect_bunny_explosion" } },
+        [99] = { ids = { "killeffect_golemyeet" }, unnamedOnly = true },
+        [93] = { ids = { "killeffect_hatching_eggs" }, babyIds = { "killeffect_chicken_tower" }, anyCount = true },
+        L = { ids = { "killeffect_lighting_strike" } },
+        [65] = { ids = { "killeffect_blood_bats", "killeffect_draculas_flight", "killeffect_batcrux" }, maybe = "several effects use bats" },
+    },
+    bed = {
+        [90] = { ids = { "beddestroy_pig_missile" }, babyIds = { "beddestroy_pigsplosion" }, manyIds = { "beddestroy_pigsplosion" }, manyAt = 3 },
+        [94] = { ids = { "beddestroy_squid_missile" } },
+        L = { ids = { "beddestroy_lighting_strike" } },
+    },
+}
+-- Riding victory dances: the mob the winner rides.
+for typ, ids in pairs({ [63] = "victorydance_dragon_rider", [64] = "victorydance_wither_rider", [56] = "victorydance_ghast_rider",
+    [100] = "victorydance_yeehaw", [68] = "victorydance_elder_guardian_rider", [93] = "victorydance_chicken_rider" }) do
+    D.DANCE_RIDES[typ] = D.DANCE_RIDES[typ] or { ids = { ids }, confirmed = true }
+end
 
 -- Constants
 
@@ -518,6 +555,52 @@ local function signFits(features, sign)
     return true
 end
 
+-- What the mobs at a kill or bed break mean (FX_MOBS), or nil.
+local function mobMeaning(g, ev)
+    local byType = FX_MOBS[ev.kind]
+    if not byType or not g.mobs then return nil end
+    local groups, order = {}, {}
+    for _, m in ipairs(g.mobs) do
+        if byType[m.type] and fits(ev, m.pos, m.at) then
+            if not groups[m.type] then groups[m.type] = {}; order[#order + 1] = m.type end
+            local meta = g.mobMeta[m.id] or {}
+            local list = groups[m.type]
+            list[#list + 1] = { baby = meta.baby, named = meta.named }
+        end
+    end
+    local best
+    for _, typ in ipairs(order) do
+        local mean, list = byType[typ], groups[typ]
+        local babies, named = 0, false
+        for _, x in ipairs(list) do
+            if x.baby then babies = babies + 1 end
+            if x.named then named = true end
+        end
+        local grown = #list - babies
+        local out
+        if mean.unnamedOnly and named then
+            out = nil
+        elseif mean.manyIds and babies == 0 and grown >= mean.manyAt then
+            out = { ids = mean.manyIds }
+        elseif mean.babyIds then
+            if babies > 0 and grown == 0 then out = { ids = mean.babyIds, maybe = mean.maybe }
+            elseif babies == 0 and (grown == 1 or mean.anyCount) then out = { ids = mean.ids, maybe = mean.maybe }
+            else
+                local both = {}
+                for _, id in ipairs(mean.ids) do both[#both + 1] = id end
+                for _, id in ipairs(mean.babyIds) do both[#both + 1] = id end
+                out = { ids = both, maybe = grown .. " grown and " .. babies .. " baby mobs appeared" }
+            end
+        elseif babies == 0 then
+            if mean.adultOnly and grown ~= 1 then out = { ids = mean.ids, maybe = grown .. " appeared at once" }
+            else out = { ids = mean.ids, maybe = mean.maybe } end
+        end
+        -- A sure meaning beats a guess.
+        if out and (not best or (best.maybe and not out.maybe)) then best = out end
+    end
+    return best
+end
+
 local function judgeEvent(g, ev)
     if not ev.owner or not (ev.kind == "bed" or ev.final) then return end
     local matched = {}
@@ -525,6 +608,13 @@ local function judgeEvent(g, ev)
         if sign.kind == ev.kind and signFits(ev.features, sign) then matched[#matched + 1] = sign end
     end
     local learned = false
+    if #matched == 0 then
+        local m = mobMeaning(g, ev)
+        if m then
+            matched[1] = { ids = m.ids, confirmed = m.maybe == nil }
+            ev.mobMaybe = m.maybe
+        end
+    end
     if #matched == 0 then
         -- Looks learned from real games (only when no sign fits).
         for _, sign in ipairs(D.LEARNED and D.LEARNED[ev.kind] or {}) do
@@ -563,7 +653,7 @@ local function judgeEvent(g, ev)
     if others then
         addClue(g, ev.owner, kind, ids, false, "another kill was close by")
     elseif not confirmed then
-        addClue(g, ev.owner, kind, ids, false, "not confirmed yet")
+        addClue(g, ev.owner, kind, ids, false, ev.mobMaybe or "not confirmed yet")
     elseif #matched > 1 and #ids > 1 then
         addClue(g, ev.owner, kind, ids, false, "looks like more than one")
     else
@@ -587,6 +677,10 @@ local function onKillLine(g, line, raw)
         if spot and now() - spot.at < 3000 then pos = spot.pos else pos = playerPos(owner) end
     elseif victim then
         pos = g.lastPos[lower(victim)] or playerPos(victim)
+        if not pos and lower(victim) == lower(meName() or "") then
+            local me = starfish.players.me()
+            pos = me and me.position and { x = me.position.x, y = me.position.y, z = me.position.z } or nil
+        end
     end
     local me = starfish.players.me()
     local ev = { kind = bed and "bed" or "kill", final = final, owner = owner, at = now(), pos = pos,
@@ -631,7 +725,10 @@ end
 local function shooterNear(pos, shooterId)
     if shooterId and shooterId > 0 then
         for _, p in ipairs(starfish.players.all()) do
-            if p.entityId == shooterId or p.entityId == shooterId - 1 then return p.name end
+            if p.entityId == shooterId then return p.name end
+        end
+        for _, p in ipairs(starfish.players.all()) do
+            if p.entityId == shooterId - 1 then return p.name end
         end
     end
     local best, bestDist = nil, SHOOTER_BLOCKS
@@ -826,23 +923,52 @@ local OBJECT_KINDS = { [1] = "boat", [2] = "item", [10] = "minecart", [50] = "tn
     [65] = "ender_pearl", [66] = "wither_skull", [70] = "falling_block", [71] = "item_frame",
     [72] = "eye_of_ender", [73] = "potion", [75] = "xp_bottle", [76] = "firework_rocket",
     [77] = "leash_knot", [78] = "armor_stand", [90] = "fishing_hook" }
-local MOB_KINDS = {}
-for name, id in pairs(D.MOB_IDS) do MOB_KINDS[id] = name end
+local MOB_KINDS = { [50] = "creeper", [51] = "skeleton", [52] = "spider", [53] = "giant", [54] = "zombie",
+    [55] = "slime", [56] = "ghast", [57] = "zombie_pigman", [58] = "enderman", [59] = "cave_spider",
+    [60] = "silverfish", [61] = "blaze", [62] = "magma_cube", [63] = "ender_dragon", [64] = "wither",
+    [65] = "bat", [66] = "witch", [67] = "endermite", [68] = "guardian", [90] = "pig", [91] = "sheep",
+    [92] = "cow", [93] = "chicken", [94] = "squid", [95] = "wolf", [96] = "mooshroom", [97] = "snow_golem",
+    [98] = "ocelot", [99] = "iron_golem", [100] = "horse", [101] = "rabbit", [120] = "villager" }
 
--- What a spawned entity is, as "minecraft:<name>". The spawn event's kind can be
--- a category ("player", "object", "mob"), so the tracked entity is asked first.
+-- What a spawned entity is, as "minecraft:<name>". Spawn events say "object" or
+-- "mob" plus a type number; the tracked entity only says "minecraft:object".
+local spawnKinds = {} -- entity id -> kind, for later events that only carry the id
 local function spawnKind(e)
-    local ent = e.entityId and starfish.entities.byId(e.entityId)
-    local k = ent and ent.kind
-    if type(k) == "string" and k:find(":", 1, true) then return k end
-    k = tostring(e.kind or "")
+    local k = tostring(e.kind or "")
     local t = e.type or e.entityType or e.objectType or e.mobType
-    if (k == "object" or k == "mob") and type(t) == "string" then return t end
-    t = tonumber(t)
-    if k == "object" and t then return "minecraft:" .. (OBJECT_KINDS[t] or ("object_" .. t)) end
-    if k == "mob" and t then return "minecraft:" .. (MOB_KINDS[t] or ("mob_" .. t)) end
-    if k:find("weather", 1, true) or k:find("lightning", 1, true) then return "minecraft:lightning_bolt" end
-    return k
+    local out
+    if (k == "object" or k == "mob") and type(t) == "string" then out = t
+    elseif k == "object" and tonumber(t) then out = "minecraft:" .. (OBJECT_KINDS[tonumber(t)] or ("object_" .. t))
+    elseif k == "mob" and tonumber(t) then out = "minecraft:" .. (MOB_KINDS[tonumber(t)] or ("mob_" .. t))
+    elseif k:find("weather", 1, true) or k:find("lightning", 1, true) then out = "minecraft:lightning_bolt"
+    elseif k:find(":", 1, true) and k ~= "minecraft:object" and k ~= "minecraft:mob" then out = k
+    else
+        local ent = e.entityId and starfish.entities.byId(e.entityId)
+        local bk = ent and ent.kind
+        if type(bk) == "string" and bk ~= "minecraft:object" and bk ~= "minecraft:mob" then out = bk else out = k end
+    end
+    if e.entityId then spawnKinds[e.entityId] = out end
+    return out
+end
+local MOB_NUMS = {}
+for n, k in pairs(MOB_KINDS) do MOB_NUMS[k] = n end
+MOB_NUMS.golem = 99; MOB_NUMS.villager_golem = 99; MOB_NUMS.entity_horse = 100; MOB_NUMS.mushroom_cow = 96
+
+-- Baby (age below 0) and custom name, from a mob's metadata.
+local function noteMobMeta(mm, md)
+    for k, m in pairs(type(md) == "table" and md or {}) do
+        local idx = type(m) == "table" and tonumber(m.index or m.key) or tonumber(k)
+        local v = type(m) == "table" and m.value or m
+        if idx == 12 and tonumber(v) then mm.baby = tonumber(v) < 0 end
+        if idx == 2 and type(v) == "string" and plain(v):match("%S") then mm.named = true end
+    end
+end
+
+local function kindOfId(id)
+    if not id then return nil end
+    if spawnKinds[id] then return spawnKinds[id] end
+    local ent = starfish.entities.byId(id)
+    return ent and ent.kind
 end
 
 local items = {} -- item entity id -> pos (counted once its stack arrives)
@@ -853,9 +979,22 @@ starfish.events.on("entity:spawn", function(e)
     local pos = posOf(e)
     if not pos then return end
     local name = kindName(spawnKind(e))
-    if name:find("lightning", 1, true) then tally("lightning", "bolt", pos, 1) return end
+    if name:find("lightning", 1, true) then
+        tally("lightning", "bolt", pos, 1)
+        g.mobs[#g.mobs + 1] = { type = "L", pos = pos, at = now() }
+        return
+    end
     if name == "player" then return end
-    if OBJECTS[name] then tally("object", name, pos, 1) else tally("mob", name, pos, 1) end
+    if OBJECTS[name] then tally("object", name, pos, 1) else
+        tally("mob", name, pos, 1)
+        local typ = MOB_NUMS[name:gsub(" ", "_")]
+        if typ and e.entityId and g.startAt then
+            g.mobs[#g.mobs + 1] = { id = e.entityId, type = typ, pos = pos, at = now() }
+            if #g.mobs > 400 then table.remove(g.mobs, 1) end
+            g.mobMeta[e.entityId] = g.mobMeta[e.entityId] or {}
+            noteMobMeta(g.mobMeta[e.entityId], e.metadata)
+        end
+    end
     if name == "item" then items[e.entityId] = { pos = pos, at = now() } end
     local shotType = SHOT_TYPES[name]
     if shotType and e.entityId then onShot(g, e.entityId, shotType, pos, e) end
@@ -870,6 +1009,8 @@ end
 starfish.events.on("entity:metadata", function(e)
     local g = game
     local id = e.entity and e.entity.entityId
+    local mm = g and id and g.mobMeta[id]
+    if mm then noteMobMeta(mm, e.metadata) return end
     local it = id and items[id]
     if not g or not it or it.done then return end
     for _, m in ipairs(e.metadata or {}) do
@@ -908,7 +1049,22 @@ starfish.events.on("entity:move", function(e)
 end)
 
 starfish.events.on("entity:despawn", function(e)
-    for _, id in ipairs(e.entityIds or {}) do items[id] = nil end
+    for _, id in ipairs(e.entityIds or {}) do items[id] = nil; spawnKinds[id] = nil end
+end)
+
+-- A shot's speed comes in its own packet, just after the spawn.
+starfish.events.on("entity:velocity", function(e)
+    local g = game
+    local id = e.entity and e.entity.entityId
+    local shot = g and id and g.flying[id]
+    local w = e.velocity
+    if not shot or type(w) ~= "table" then return end
+    local x, y, z = tonumber(w.x) or 0, tonumber(w.y) or 0, tonumber(w.z) or 0
+    if math.abs(x) > 10 or math.abs(y) > 10 or math.abs(z) > 10 then x, y, z = x / 8000, y / 8000, z / 8000 end
+    local t = now()
+    shot.start = shot.known and now() - shot.knownAt < 300 and shot.known or shotAt(shot, t)
+    shot.at, shot.vel = t, { x = x, y = y, z = z }
+    shot.known = nil
 end)
 
 starfish.events.on("world:blockBreakAnimation", function(e)
@@ -1520,7 +1676,7 @@ X = require("extras")({
     D = D, now = now, flat = flat, dist = dist, lower = lower, plain = plain, posOf = posOf, uuidVersion = uuidVersion,
     game = function() return game end, addClue = addClue, removeClue = removeClue, clearKind = clearKind,
     isNick = isNick, realNameOf = realNameOf, tally = tally, signFits = signFits,
-    itemOf = function(id) local it = id and items[id]; return it and it.num end, spawnKind = spawnKind,
+    itemOf = function(id) local it = id and items[id]; return it and it.num end, spawnKind = spawnKind, kindOfId = kindOfId,
 })
 
 -- Chat in
@@ -1569,7 +1725,8 @@ end)
 
 local function newGame()
     for k in pairs(items) do items[k] = nil end
-    return { nicks = {}, order = {}, events = {}, recent = {}, flying = {}, lastPos = {}, breaking = {}, endAt = nil, startedAt = now() }
+    for k in pairs(spawnKinds) do spawnKinds[k] = nil end
+    return { nicks = {}, order = {}, events = {}, recent = {}, flying = {}, lastPos = {}, breaking = {}, mobs = {}, mobMeta = {}, endAt = nil, startedAt = now() }
 end
 
 local function endGame()
@@ -1595,8 +1752,10 @@ local function endGame()
             starfish.chat.info("§7Cosmetic Denicker: set §f/cd key§7 and turn on Auto Block.")
         end
         autoLookups(g)
-        -- Only the nicks are needed from here on.
-        g.events, g.recent, g.recentHead, g.flying, g.lastPos, g.breaking = {}, {}, 1, {}, {}, {}
+        -- Only the nicks are needed from here on (once a dance has been judged).
+        starfish.timers.delay(15000, function()
+            g.events, g.recent, g.recentHead, g.flying, g.lastPos, g.breaking = {}, {}, 1, {}, {}, {}
+        end)
     end)
 end
 
@@ -1752,6 +1911,7 @@ starfish.plugin.export("getClues", function(nick)
 end)
 
 -- Startup
+
 
 applyLocation(starfish.plugins.require("hypixel-mod-api").getLocation())
 
