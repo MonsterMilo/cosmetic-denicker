@@ -902,7 +902,7 @@ starfish.events.on("entity:spawn", function(e)
     if not g or not g.startAt then return end
     local pos = C.posOf(e)
     if not pos then return end
-    local typ, k = mobType(e.kind)
+    local typ, k = mobType(C.spawnKind(e))
     if k == "player" then
         local uuid = e.uuid or e.playerUuid or e.playerUUID
         if not uuid and e.entityId then
