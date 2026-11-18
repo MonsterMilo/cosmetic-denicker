@@ -3,7 +3,7 @@ plugin = {
     displayName = "Cosmetic Denicker",
     command = "cd",
     prefix = "§dCD",
-    version = "0.1.0",
+    version = "0.1.1",
     minStarfishVersion = "0.1.0-beta.19",
     description = "Beta. Spots nicked players' cosmetics and finds who they are after the game",
     readme = [[
@@ -242,7 +242,7 @@ local function saveNicks(g)
     for _, e in pairs(s) do if (e.seq or 0) > savedSeq then savedSeq = e.seq end end
     for _, key in ipairs(g.order) do
         local n = g.nicks[key]
-        if not (n.real or realNameOf(n.name)) then
+        if not (n.real or realNameOf(n.name)) and (next(n.clues) or next(n.numbers or {}) or n.killPacks) then
             savedSeq = savedSeq + 1
             s[key] = { name = n.name, uuid = n.uuid, clues = copy(n.clues), killPacks = copy(n.killPacks), killConflict = n.killConflict or nil, numbers = copy(n.numbers or {}), seq = savedSeq, saved = true }
         end
@@ -478,7 +478,16 @@ local function tally(kind, name, pos, count)
     local key = kind .. ":" .. name
     local recent = g.recent
     recent[#recent + 1] = { key = key, pos = pos, count = count, at = t }
-    while #recent > 0 and (t - recent[1].at > EARLY_MS or #recent > 3000) do table.remove(recent, 1) end
+    local head = g.recentHead or 1
+    while head <= #recent and (t - recent[head].at > EARLY_MS or #recent - head >= 3000) do
+        head = head + 1
+    end
+    if head > 512 then
+        local moved = {}
+        for i = head, #recent do moved[#moved + 1] = recent[i] end
+        g.recent, head = moved, 1
+    end
+    g.recentHead = head
     for i = #g.events, 1, -1 do
         local ev = g.events[i]
         if t - ev.at > (ev.window or SIGN_MS) + 1000 then
@@ -585,8 +594,9 @@ local function onKillLine(g, line, raw)
     g.events[#g.events + 1] = ev
     if X then X.kill(g, ev, victim, final) end
     if not pos then return end
-    for _, r in ipairs(g.recent) do
-        if fits(ev, r.pos, r.at) then ev.features[r.key] = (ev.features[r.key] or 0) + r.count end
+    for i = g.recentHead or 1, #g.recent do
+        local r = g.recent[i]
+        if r and fits(ev, r.pos, r.at) then ev.features[r.key] = (ev.features[r.key] or 0) + r.count end
     end
     starfish.timers.delay(SIGN_MS + 500, function()
         if game == g or lastGame == g then judgeEvent(g, ev) end
@@ -707,9 +717,19 @@ local function onShot(g, entityId, typeId, pos, data)
     local vel = { x = 0, y = 0, z = 0 }
     local shooterId = nil
     if type(data) == "table" then
-        shooterId = tonumber(data.intField or data.ownerId or data.data)
-        local function v(k) return (tonumber(data[k]) or 0) / 8000 end
-        vel = { x = v("velocityX"), y = v("velocityY"), z = v("velocityZ") }
+        local od = type(data.objectData) == "table" and data.objectData or nil
+        shooterId = tonumber(data.shooterId or data.ownerId or data.intField or data.data or (od and (od.intField or od.data)))
+        if type(data.velocity) == "table" then
+            local w = data.velocity
+            local x, y, z = tonumber(w.x) or 0, tonumber(w.y) or 0, tonumber(w.z) or 0
+            -- Raw packet units are 1/8000 block per tick.
+            if math.abs(x) > 10 or math.abs(y) > 10 or math.abs(z) > 10 then x, y, z = x / 8000, y / 8000, z / 8000 end
+            vel = { x = x, y = y, z = z }
+        else
+            local src = od or data
+            local function v(k) return (tonumber(src[k]) or 0) / 8000 end
+            vel = { x = v("velocityX"), y = v("velocityY"), z = v("velocityZ") }
+        end
     elseif type(data) == "number" then
         shooterId = data
     end
@@ -729,6 +749,7 @@ local function onShot(g, entityId, typeId, pos, data)
 end
 
 local function trailParticle(g, name, e, pos, count)
+    if next(g.flying) == nil then return end
     local shot = nearestShot(g, pos)
     if not shot then return end
     if (FIREBALLS[shot.type] and FIREBALL_OWN[name]) or name == "crit" then return end
@@ -799,6 +820,31 @@ local function kindName(kind)
     return KIND_ALIASES[k] or k
 end
 
+-- 1.8 object and mob type numbers -> names
+local OBJECT_KINDS = { [1] = "boat", [2] = "item", [10] = "minecart", [50] = "tnt", [51] = "ender_crystal",
+    [60] = "arrow", [61] = "snowball", [62] = "egg", [63] = "fireball", [64] = "small_fireball",
+    [65] = "ender_pearl", [66] = "wither_skull", [70] = "falling_block", [71] = "item_frame",
+    [72] = "eye_of_ender", [73] = "potion", [75] = "xp_bottle", [76] = "firework_rocket",
+    [77] = "leash_knot", [78] = "armor_stand", [90] = "fishing_hook" }
+local MOB_KINDS = {}
+for name, id in pairs(D.MOB_IDS) do MOB_KINDS[id] = name end
+
+-- What a spawned entity is, as "minecraft:<name>". The spawn event's kind can be
+-- a category ("player", "object", "mob"), so the tracked entity is asked first.
+local function spawnKind(e)
+    local ent = e.entityId and starfish.entities.byId(e.entityId)
+    local k = ent and ent.kind
+    if type(k) == "string" and k:find(":", 1, true) then return k end
+    k = tostring(e.kind or "")
+    local t = e.type or e.entityType or e.objectType or e.mobType
+    if (k == "object" or k == "mob") and type(t) == "string" then return t end
+    t = tonumber(t)
+    if k == "object" and t then return "minecraft:" .. (OBJECT_KINDS[t] or ("object_" .. t)) end
+    if k == "mob" and t then return "minecraft:" .. (MOB_KINDS[t] or ("mob_" .. t)) end
+    if k:find("weather", 1, true) or k:find("lightning", 1, true) then return "minecraft:lightning_bolt" end
+    return k
+end
+
 local items = {} -- item entity id -> pos (counted once its stack arrives)
 
 starfish.events.on("entity:spawn", function(e)
@@ -806,13 +852,13 @@ starfish.events.on("entity:spawn", function(e)
     if not g then return end
     local pos = posOf(e)
     if not pos then return end
-    local name = kindName(e.kind)
+    local name = kindName(spawnKind(e))
     if name:find("lightning", 1, true) then tally("lightning", "bolt", pos, 1) return end
     if name == "player" then return end
     if OBJECTS[name] then tally("object", name, pos, 1) else tally("mob", name, pos, 1) end
     if name == "item" then items[e.entityId] = { pos = pos, at = now() } end
     local shotType = SHOT_TYPES[name]
-    if shotType and e.entityId then onShot(g, e.entityId, shotType, pos, e.objectData or e.data or e) end
+    if shotType and e.entityId then onShot(g, e.entityId, shotType, pos, e) end
 end)
 
 local function itemKey(item)
@@ -986,7 +1032,7 @@ local function queueUnblock(name)
 end
 
 local function autoBlock(g)
-    if not starfish.config.get("autoBlock.enabled") or not g or not location.inGame then return end
+    if not starfish.config.get("autoBlock.enabled") or not g or not g.startAt or not location.inGame then return end
     for _, key in ipairs(g.order) do
         local n = g.nicks[key]
         if not n.blockQueued and not isBlocked(n.name) and not realNameOf(n.name) then
@@ -1119,7 +1165,7 @@ local function finishMatch(r, real)
     end
     starfish.events.emit("cosmetic-denicker:resolved", { nickName = r.nick, realName = real })
     if starfish.config.get("profile.unblock") then
-        starfish.timers.delay(1000, function() starfish.chat.sendToServer("/block remove " .. r.nick) end)
+        queueUnblock(r.nick)
     end
 end
 
@@ -1220,12 +1266,16 @@ end
 -- Menu trace: what /profile menus looked like, saved in the plugin's config
 -- file ("trace") so a failed check can be looked at afterwards.
 local traceBuf = {}
+local traceDirty = false
 trace = function(text)
     traceBuf[#traceBuf + 1] = os.date and (os.date("%H:%M:%S ") .. text) or text
     while #traceBuf > 80 do table.remove(traceBuf, 1) end
-    pcall(starfish.config.set, "trace", traceBuf)
+    traceDirty = true
     starfish.log.debug(text)
 end
+starfish.timers.interval(5000, function()
+    if traceDirty then traceDirty = false; pcall(starfish.config.set, "trace", traceBuf) end
+end)
 
 local function safe(name, fn)
     return function(e)
@@ -1451,16 +1501,13 @@ local function onProfileChat(text)
     local l = lower(text)
     if l:find("find a player") or l:find("player not found") or l:find("does not exist") or l:find("no player")
         or l:find("profile is unavailable") or l:find("unavailable") then
-        cancel(p.timer)
         nextAfter(r)
     elseif l:find("slow down") or l:find("too fast") or l:find("please wait") or l:find("cooldown") then
-        cancel(p.timer)
         pending = nil
         r.retries = (r.retries or 0) + 1
         if r.retries > 2 then r.state = "paused"; status("§eHypixel says slow down - resuming next lobby.") return end
         nextTimer = starfish.timers.delay(5000, function() checkNext(r) end)
     elseif l:find("only use the social menu in lobbies") or l:find("can't use this here") then
-        cancel(p.timer)
         pending = nil
         r.state = "paused"
         status("§7Not in a lobby - resuming next lobby.")
@@ -1473,7 +1520,7 @@ X = require("extras")({
     D = D, now = now, flat = flat, dist = dist, lower = lower, plain = plain, posOf = posOf, uuidVersion = uuidVersion,
     game = function() return game end, addClue = addClue, removeClue = removeClue, clearKind = clearKind,
     isNick = isNick, realNameOf = realNameOf, tally = tally, signFits = signFits,
-    itemOf = function(id) local it = id and items[id]; return it and it.num end,
+    itemOf = function(id) local it = id and items[id]; return it and it.num end, spawnKind = spawnKind,
 })
 
 -- Chat in
@@ -1521,6 +1568,7 @@ end)
 -- Location: a game starts, a game ends
 
 local function newGame()
+    for k in pairs(items) do items[k] = nil end
     return { nicks = {}, order = {}, events = {}, recent = {}, flying = {}, lastPos = {}, breaking = {}, endAt = nil, startedAt = now() }
 end
 
@@ -1529,7 +1577,9 @@ local function endGame()
     if not g then return end
     game = nil
     g.endAt = now()
-    -- A pregame left without playing doesn't replace the game before it.
+    for k in pairs(items) do items[k] = nil end
+    -- A pregame left without playing (a dodge or /l) isn't a game.
+    if not g.startAt then return end
     if next(g.nicks) == nil and lastGame then return end
     recentGames = recentGames or {}
     if lastGame then table.insert(recentGames, 1, lastGame) end
@@ -1545,6 +1595,8 @@ local function endGame()
             starfish.chat.info("§7Cosmetic Denicker: set §f/cd key§7 and turn on Auto Block.")
         end
         autoLookups(g)
+        -- Only the nicks are needed from here on.
+        g.events, g.recent, g.recentHead, g.flying, g.lastPos, g.breaking = {}, {}, 1, {}, {}, {}
     end)
 end
 
@@ -1579,7 +1631,7 @@ end)
 
 -- Auto block: once the game is under way, every few seconds
 starfish.timers.interval(5000, function()
-    if game and location.inGame then
+    if game and game.startAt and location.inGame then
         scanTab(game)
         autoBlock(game)
     end
@@ -1703,6 +1755,6 @@ end)
 
 applyLocation(starfish.plugins.require("hypixel-mod-api").getLocation())
 
--- (For tests.)
-_NC = { wipe = function() game = nil; lastGame = nil; recentGames = {} end, readKillLine = readKillLine, signFits = signFits, trailFits = trailFits, state = function() return game, lastGame, run end,
+if CD_TEST then _NC = { wipe = function() game = nil; lastGame = nil; recentGames = {} end, readKillLine = readKillLine, signFits = signFits, trailFits = trailFits, state = function() return game, lastGame, run end,
     reset = function() for k in pairs(foundByUs) do foundByUs[k] = nil end; for _, g in pairs({ a = game, b = lastGame }) do for _, n in pairs(g.nicks) do n.real = nil end end end }
+end
