@@ -3,7 +3,7 @@ plugin = {
     displayName = "Cosmetic Denicker",
     command = "cd",
     prefix = "§dCD",
-    version = "0.1.2",
+    version = "0.1.3",
     minStarfishVersion = "0.1.0-beta.19",
     description = "Beta. Spots nicked players' cosmetics and finds who they are after the game",
     readme = [[
@@ -17,7 +17,7 @@ Spots the cosmetics nicked players use in Bed Wars and helps find who they are.
 
 Unresolved nicks stay in `/cd saved` until found or removed. Removing one also unblocks it.
 
-**Commands:** `/cd` (last game), `/cd saved`, `/cd search <nick>`, `/cd remove <nick>`, `/cd clear confirm`, `/cd key <key>`, `/cd stop`.
+**Commands:** `/cd list` (last game), `/cd saved`, `/cd search <nick>`, `/cd remove <nick>`, `/cd clear confirm`, `/cd key <key>`, `/cd stop`.
 ]],
     dependencies = {
         { name = "hypixel-mod-api" },
@@ -27,12 +27,8 @@ Unresolved nicks stay in `/cd saved` until found or removed. Removing one also u
 
 local D = require("data")
 
--- Looks seen in Starfish games that the generated data lacks.
-for _, s in ipairs({
-    { ids = { "beddestroy_pig_missile" }, min = { ["sound:random.pop"] = 12, ["mob:pig"] = 1 }, kind = "bed", confirmed = true },
-    { ids = { "killeffect_cow_rocket" }, min = { ["sound:random.pop"] = 8, ["mob:cow"] = 1 }, kind = "kill", confirmed = true },
-}) do table.insert(D.FX_SIGNS, s) end
--- (Starfish leaves out the block of blockdust particles, so the bare name counts.)
+-- Starfish leaves out the block of blockdust particles (and sends Blood's
+-- trail without sparks), so the bare name counts.
 table.insert(D.TRAIL_SIGNS, { ids = { "projectiletrail_blood" }, min = { blockdust = 30 }, confirmed = true })
 
 -- Mobs (and lightning, "L") that kill effects and bed destroys spawn where
@@ -80,6 +76,7 @@ local MENU_WAIT_MS = 5000
 local MENU_SETTLE_MS = 600
 local LOBBY_SETTLE_MS = 2500
 local BLOCK_GAP_MS = 1500
+local DANCE_WAIT_MS = 10000   -- a victory dance is judged this long after the game ends
 local AURORA_URL = "https://api.bordic.xyz/v3/lookup/players"
 
 local FIREBALLS = { [63] = true, [64] = true }
@@ -804,8 +801,11 @@ local function endShot(g, shot)
     for _, s in ipairs(signs) do
         for _, id in ipairs(s.ids) do if not got[id] then got[id] = true; ids[#ids + 1] = id end end
     end
-    if #signs > 1 then addClue(g, shot.shooter, "trail", ids, false, "looks like more than one")
-    elseif not signs[1].confirmed then addClue(g, shot.shooter, "trail", ids, false, "not confirmed yet")
+    local sure = false
+    for _, s in ipairs(signs) do sure = sure or s.confirmed end
+    -- (Two signs for the same trail are one match.)
+    if #ids > 1 then addClue(g, shot.shooter, "trail", ids, false, "looks like more than one")
+    elseif not sure then addClue(g, shot.shooter, "trail", ids, false, "not confirmed yet")
     else addClue(g, shot.shooter, "trail", ids, true) end
 end
 
@@ -1128,12 +1128,8 @@ local function nickLine(g, n, short)
     local head = component((real and "§a" or "§c") .. n.name .. (real and (" §8→ §a" .. real) or ""), table.concat(hover, "\n"))
     local line = head .. starfish.text.of(" §8· " .. (#parts > 0 and table.concat(parts, "§8, ") or "§8no cosmetics seen"))
     if not real and not short then
-        local blocked = starfish.config.get("blocked")[lower(n.name)]
         if cosmeticCount(n) <= 1 then line = line .. starfish.text.of(" §8few clues") end
         line = line .. starfish.text.of(" ") .. component("§b[Search]", "§7Search Aurora and check with /profile", "/cd search " .. n.name)
-        if not blocked then
-            line = line .. starfish.text.of(" ") .. component("§7[Block]", "§7Needed for /profile to confirm", "/block add " .. n.name)
-        end
         if n.saved then
             line = line .. starfish.text.of(" ") .. component("§7[Remove]", "§7Remove and unblock", "/cd remove " .. n.name)
         end
@@ -1296,8 +1292,7 @@ startChecking = function(r)
         awaitingBlock[lower(r.nick)] = r
         local list = {}
         for i = 1, math.min(10, #r.candidates) do list[i] = r.candidates[i] end
-        starfish.chat.sendToClient(starfish.text.of("§7" .. r.nick .. " isn't blocked, so /profile can't check. Candidates: §f" .. table.concat(list, "§7, §f") .. " ")
-            .. component("§7[Block]", "§7Block to start checking", "/block add " .. r.nick))
+        status("§7" .. r.nick .. " wasn't blocked in the game, so /profile can't check. Candidates: §f" .. table.concat(list, "§7, §f"))
         finishRun(r)
         return
     end
@@ -1743,8 +1738,11 @@ local function endGame()
     while #recentGames > 5 do table.remove(recentGames) end
     lastGame = g
     saveNicks(g)
-    -- Wait for the last effects to be judged.
-    starfish.timers.delay(SIGN_MS + 1000, function()
+    -- Wait for the last effects (and the victory dance) to be judged.
+    local wait = SIGN_MS + 1000
+    if g.overAt then wait = math.max(wait, g.overAt + DANCE_WAIT_MS - now()) end
+    starfish.timers.delay(wait, function()
+        saveNicks(g)
         if starfish.config.get("summary.enabled") then showSummary(g) end
         local key = starfish.config.get("lookup.key")
         if next(g.nicks) and not starfish.config.get("hinted") and (not key or key == "" or not starfish.config.get("autoBlock.enabled")) then
