@@ -1,7 +1,7 @@
 {
   "name": "cosmetic-denicker",
   "display_name": "Cosmetic Denicker",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Beta. Spots nicked players' cosmetics and finds who they are after the game",
   "prefix": "§dCD",
   "homepage": null,
@@ -18,10 +18,6 @@
     }
   ],
   "commands": [
-    {
-      "usage": "/capture [action]",
-      "description": "Debug capture (temporary)"
-    },
     {
       "usage": "/clear [confirm]",
       "description": "Remove all saved nicks"
