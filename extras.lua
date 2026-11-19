@@ -1139,8 +1139,5 @@ starfish.events.on("world:particle", function(e)
     end
 end)
 
--- (For tests.)
-X._topperLook, X._topperNear, X._figurineId, X._mobLook, X._lookId = topperLook, topperNear, figurineId, mobLook, lookId
-X._skins = skins
 return X
 end
