@@ -3,7 +3,7 @@ plugin = {
     displayName = "Cosmetic Denicker",
     command = "cd",
     prefix = "§dCD",
-    version = "0.1.3",
+    version = "0.1.4",
     minStarfishVersion = "0.1.0-beta.19",
     description = "Beta. Spots nicked players' cosmetics and finds who they are after the game",
     readme = [[
@@ -169,7 +169,7 @@ starfish.schema.section({
     },
 })
 
-starfish.config.defaults({ blocked = {}, trace = {}, saved = {}, hinted = false })
+starfish.config.defaults({ blocked = {}, saved = {}, hinted = false })
 
 -- Small helpers
 
@@ -252,7 +252,7 @@ local location = { inGame = false, inLobby = false, server = nil, inBedwars = fa
 local game = nil       -- the game being played
 local X = nil          -- extras.lua
 local recentGames = {} -- the few games before lastGame
-local lastGame = nil   -- the one before (for /cd and lookups)
+local lastGame = nil   -- the one before (for /cd list and lookups)
 
 -- Saved nicks: every unresolved nick stays here until it's found or removed.
 local SAVED_MAX = 200
@@ -1372,7 +1372,7 @@ local function search(n, quiet)
                 table.sort(kept, function(a, b2) if a.gap ~= b2.gap then return a.gap < b2.gap end return a.i < b2.i end)
                 if #kept > 0 then rows = kept end
             end
-            pcall(trace, ("Aurora for %s: %d rows, top %s"):format(n.name, #res.data.data, (function()
+            trace(("Aurora for %s: %d rows, top %s"):format(n.name, #res.data.data, (function()
                 local t = {}
                 for i = 1, math.min(5, #rows) do local c = rows[i].c; t[#t + 1] = tostring(c.displayname or c.name) .. ":" .. tostring(c.finals or c.final_kills) end
                 return table.concat(t, ",") end)()))
@@ -1414,19 +1414,8 @@ end
 
 -- /profile replies
 
--- Menu trace: what /profile menus looked like, saved in the plugin's config
--- file ("trace") so a failed check can be looked at afterwards.
-local traceBuf = {}
-local traceDirty = false
-trace = function(text)
-    traceBuf[#traceBuf + 1] = os.date and (os.date("%H:%M:%S ") .. text) or text
-    while #traceBuf > 80 do table.remove(traceBuf, 1) end
-    traceDirty = true
-    starfish.log.debug(text)
-end
-starfish.timers.interval(5000, function()
-    if traceDirty then traceDirty = false; pcall(starfish.config.set, "trace", traceBuf) end
-end)
+-- What each /profile check saw, in Starfish's debug log.
+trace = function(text) starfish.log.debug(text) end
 
 local function safe(name, fn)
     return function(e)
@@ -1570,7 +1559,7 @@ adopt = function(p, windowId, how)
     if p.items then judgeMenu(windowId) end
 end
 
--- One steady ticker drives the check (short-lived timers went missing live).
+-- One steady ticker drives the check (a delay timer can go missing).
 starfish.timers.interval(100, safe("ticker", function()
     local p = pending
     -- Backup in case a delay timer never fires.
@@ -1910,9 +1899,4 @@ end)
 
 -- Startup
 
-
 applyLocation(starfish.plugins.require("hypixel-mod-api").getLocation())
-
-if CD_TEST then _NC = { wipe = function() game = nil; lastGame = nil; recentGames = {} end, readKillLine = readKillLine, signFits = signFits, trailFits = trailFits, state = function() return game, lastGame, run end,
-    reset = function() for k in pairs(foundByUs) do foundByUs[k] = nil end; for _, g in pairs({ a = game, b = lastGame }) do for _, n in pairs(g.nicks) do n.real = nil end end end }
-end
