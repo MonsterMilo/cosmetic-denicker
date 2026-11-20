@@ -3,21 +3,21 @@ plugin = {
     displayName = "Cosmetic Denicker",
     command = "cd",
     prefix = "§dCD",
-    version = "0.1.4",
+    version = "0.1.5",
     minStarfishVersion = "0.1.0-beta.19",
     description = "Beta. Spots nicked players' cosmetics and finds who they are after the game",
     readme = [[
 Spots the cosmetics nicked players use in Bed Wars and helps find who they are.
 
-**Setup**
+**Setup** (the Setup section in settings says what's missing)
 1. Get an Aurora API key and set it with `/cd key <key>`.
-2. Turn on **Auto Block Nicks**. A nick must be on your block list for `/profile` to confirm who it is.
+2. Turn on **Auto Block Nicks** (or `/cd autoblock`). Only a blocked nick can be confirmed.
 
-**After a game** you get a list of nicks and their cosmetics. **[Search]** asks Aurora for players with those cosmetics, then checks each one with `/profile` in a lobby. The profile menu shows "Unblock Player" for the real account.
+**After a game** you get a list of nicks and their cosmetics. **[Search]** asks Aurora for players with those cosmetics. In the next lobby each one is checked with `/profile`: the real account shows "Unblock Player". The menus open and close by themselves, and the action bar shows progress.
 
-Unresolved nicks stay in `/cd saved` until found or removed. Removing one also unblocks it.
+Unfound nicks stay in `/cd saved` until found or removed. Removing one also unblocks it.
 
-**Commands:** `/cd list` (last game), `/cd saved`, `/cd search <nick>`, `/cd remove <nick>`, `/cd clear confirm`, `/cd key <key>`, `/cd stop`.
+**Commands:** `/cd list` (last game), `/cd saved`, `/cd search <nick>`, `/cd remove <nick>`, `/cd clear confirm`, `/cd key <key>`, `/cd autoblock [off]`, `/cd stop`.
 ]],
     dependencies = {
         { name = "hypixel-mod-api" },
@@ -76,6 +76,8 @@ local MENU_WAIT_MS = 5000
 local MENU_SETTLE_MS = 600
 local LOBBY_SETTLE_MS = 2500
 local BLOCK_GAP_MS = 1500
+local CHECK_GAP_MS = 1500     -- between /profile checks
+local MAX_CANDIDATES = 20
 local DANCE_WAIT_MS = 10000   -- a victory dance is judged this long after the game ends
 local AURORA_URL = "https://api.bordic.xyz/v3/lookup/players"
 
@@ -123,51 +125,59 @@ local KIND_ORDER = { "effect", "bed", "trail", "killmsg", "deathcry", "dance", "
 
 -- Config schema
 
-starfish.schema.section({
-    key = "summary",
-    label = "After Each Game",
-    description = "List the nicks you played with and the cosmetics they showed.",
-    settings = {
-        { key = "summary.enabled", type = "toggle", default = true, label = "Enabled", description = "Show the list after each game." },
-        { key = "summary.resolved", type = "toggle", default = true, label = "Show Known Nicks", description = "List nicks already identified." },
-        { key = "summary.maybes", type = "toggle", default = true, label = "Show Guesses", description = "Show unsure cosmetics." },
-    },
-})
+-- Setup comes first; its description says what's missing or what's running.
+local setupNote = nil -- set while a search is running
 
-starfish.schema.section({
-    key = "lookup",
-    label = "Aurora Lookup",
-    description = "Search Aurora for players with a nick's cosmetics after the game.",
-    settings = {
-        { key = "lookup.auto", type = "toggle", default = false, label = "Auto Search", description = "Search nicks after each game." },
-        { key = "lookup.key", type = "text", default = "", label = "Aurora Key", description = "Your Aurora API key.", setCommand = "/cd key" },
-        { key = "lookup.max", type = "cycle", default = 20, label = "Max Candidates", description = "Players checked per nick.", values = {
-            { text = "10", value = 10 }, { text = "20", value = 20 }, { text = "30", value = 30 },
-        } },
-    },
-})
+local function setupText()
+    if setupNote then return setupNote end
+    local key = starfish.config.get("lookup.key")
+    local missing = {}
+    if not key or key == "" then missing[#missing + 1] = "set your Aurora key" end
+    if not starfish.config.get("autoBlock.enabled") then missing[#missing + 1] = "turn on Auto Block Nicks" end
+    if #missing > 0 then return "Not ready: " .. table.concat(missing, " and ") .. "." end
+    return "Ready. Nicks get blocked in games and checked after."
+end
 
-starfish.schema.section({
-    key = "profile",
-    label = "Profile Check",
-    description = "Confirm candidates with /profile. Needs Auto Block.",
-    settings = {
-        { key = "profile.enabled", type = "toggle", default = true, label = "Enabled", description = "Check Aurora's candidates with /profile." },
-        { key = "profile.gap", type = "cycle", default = 1500, label = "Check Delay", description = "Time between /profile checks.", values = {
-            { text = "1s", value = 1000 }, { text = "1.5s", value = 1500 }, { text = "2s", value = 2000 }, { text = "3s", value = 3000 },
-        } },
-        { key = "profile.unblock", type = "toggle", default = true, label = "Unblock When Found", description = "Unblock the nick once identified." },
-    },
-})
+-- All sections are declared again, in order, when the Setup text changes.
+local shownSetup = nil
+local function refreshSetup()
+    local text = setupText()
+    if text == shownSetup then return end
+    shownSetup = text
+    pcall(starfish.schema.clear)
+    starfish.schema.section({
+        key = "setup",
+        label = "Setup",
+        description = text,
+        settings = {
+            { key = "lookup.key", type = "text", default = "", label = "Aurora Key", description = "Needed to search for who a nick is.", setCommand = "/cd key" },
+            { key = "autoBlock.enabled", type = "toggle", default = false, label = "Auto Block Nicks", description = "Blocks nicks during games. Only blocked nicks can be confirmed." },
+        },
+    })
+    starfish.schema.section({
+        key = "lookup",
+        label = "Finding Nicks",
+        description = "Aurora suggests players, then /profile confirms the right one in a lobby.",
+        settings = {
+            { key = "lookup.auto", type = "toggle", default = false, label = "Auto Search", description = "Search nicks after each game." },
+            { key = "profile.enabled", type = "toggle", default = true, label = "Confirm With /profile", description = "Off: only list the players Aurora suggests." },
+            { key = "profile.unblock", type = "toggle", default = true, label = "Auto Unblock", description = "Unblock a nick once it's found." },
+        },
+    })
+    starfish.schema.section({
+        key = "summary",
+        label = "After Each Game",
+        settings = {
+            { key = "summary.enabled", type = "toggle", default = true, label = "Nick List", description = "List nicks and their cosmetics after each game." },
+            { key = "summary.maybes", type = "toggle", default = true, label = "Show Guesses", description = "Include cosmetics that aren't certain." },
+        },
+    })
+end
+refreshSetup()
 
-starfish.schema.section({
-    key = "autoBlock",
-    label = "Auto Block Nicks",
-    description = "Block nicks during the game.",
-    settings = {
-        { key = "autoBlock.enabled", type = "toggle", default = false, label = "Enabled", description = "Block nicks so they can be identified." },
-    },
-})
+for _, k in ipairs({ "lookup.key", "autoBlock.enabled" }) do
+    pcall(starfish.config.onChange, k, function() refreshSetup() end)
+end
 
 starfish.config.defaults({ blocked = {}, saved = {}, hinted = false })
 
@@ -288,6 +298,16 @@ local function saveNicks(g)
         for i = 1, #keys - SAVED_MAX do s[keys[i]] = nil end
     end
     starfish.config.set("saved", s)
+end
+
+-- Updates the saved nicks of a game whose clues changed later.
+local function resave(g)
+    local s, changed = savedList(), false
+    for _, key in ipairs(g.order) do
+        local n = g.nicks[key]
+        if s[key] and not n.real then s[key].clues = copy(n.clues); changed = true end
+    end
+    if changed then starfish.config.set("saved", s) end
 end
 
 -- Players
@@ -684,6 +704,7 @@ local function onKillLine(g, line, raw)
         me = me and me.position and { x = me.position.x, y = me.position.y, z = me.position.z } or nil, features = {} }
     g.events[#g.events + 1] = ev
     if X then X.kill(g, ev, victim, final) end
+    if bed and X then X.bedLine(g, line) end
     if not pos then return end
     for i = g.recentHead or 1, #g.recent do
         local r = g.recent[i]
@@ -1081,12 +1102,27 @@ end)
 
 -- The list after a game
 
+-- Two different ones seen for sure: they use Random (or changed it, and
+-- the search then drops it).
+local RANDOM_KINDS = { effect = true, bed = true, trail = true, deathcry = true, dance = true, glyph = true }
+
+local function randomClue(n, kind)
+    if not RANDOM_KINDS[kind] then return nil end
+    local seen = {}
+    for _, c in pairs(n.clues[kind] or {}) do
+        if c.sure and #c.ids == 1 then seen[#seen + 1] = shown(kind, c.ids[1]) end
+    end
+    if #seen < 2 then return nil end
+    table.sort(seen)
+    return { ids = { "random_cosmetic" }, sure = true, random = true, count = #seen, why = "saw " .. table.concat(seen, ", ") }
+end
+
 local function bestClues(n, maybes)
     local out = {}
     for _, kind in ipairs(KIND_ORDER) do
-        local best = nil
+        local best = randomClue(n, kind)
         for _, c in pairs(n.clues[kind] or {}) do
-            if c.sure or maybes then
+            if (c.sure or maybes) and not (best and best.random) then
                 if not best or (c.sure and not best.sure) or (c.sure == best.sure and c.count > best.count) then best = c end
             end
         end
@@ -1139,12 +1175,11 @@ end
 
 local function showSummary(g)
     if not g then return end
-    local shownResolved = starfish.config.get("summary.resolved")
     local lines = {}
     for _, key in ipairs(g.order) do
         local n = g.nicks[key]
         n.real = n.real or realNameOf(n.name)
-        if shownResolved or not n.real then lines[#lines + 1] = n end
+        lines[#lines + 1] = n
     end
     if #lines == 0 then return false end
     starfish.chat.info("§f" .. #lines .. " nick" .. (#lines == 1 and "" or "s") .. " this game")
@@ -1168,12 +1203,17 @@ end
 
 local blockQueue, blockBusy, blockBusyAt = {}, false, nil
 
+local ownBlockReplies = {} -- "blocked x" / "unblocked x" -> until when it's hidden
+
 local function pumpBlocks()
     if blockBusy or #blockQueue == 0 then return end
     blockBusy = true
     blockBusyAt = now()
     local item = table.remove(blockQueue, 1)
-    starfish.chat.sendToServer(item:sub(1, 1) == "/" and item or ("/block add " .. item))
+    local cmd = item:sub(1, 1) == "/" and item or ("/block add " .. item)
+    local verb, who = cmd:match("^/block (%a+) ([%w_]+)")
+    if who then ownBlockReplies[(verb == "remove" and "unblocked " or "blocked ") .. lower(who)] = now() + 5000 end
+    starfish.chat.sendToServer(cmd)
     starfish.timers.delay(BLOCK_GAP_MS, function() blockBusy = false; pumpBlocks() end)
 end
 
@@ -1209,21 +1249,34 @@ local function cancel(sub) if sub then pcall(function() sub:off() end) end end
 local seenWindows = {} -- menus already handled (Starfish can still report an old one as open)
 local adopt, trace
 
-local function status(text) starfish.chat.info(text) end
+-- What the search is doing, shown under Setup in the plugin's settings.
+local function noteRun()
+    local r = run
+    local note = nil
+    if r and r.state == "checking" then
+        note = "Checking " .. r.nick .. ": " .. math.min(r.index, #r.candidates) .. " of " .. #r.candidates .. "."
+    elseif r then
+        note = "Waiting for a lobby to check " .. r.nick .. "."
+    end
+    if note ~= setupNote then setupNote = note; refreshSetup() end
+end
+
+local function status(text) starfish.chat.info(text); noteRun() end
 
 local function lookupBody(n)
-    local body, used = {}, {}
+    local body, used, randoms = {}, {}, {}
     for _, item in ipairs(bestClues(n, false)) do
         local k, c = item.kind, item.clue
         if c.sure and #c.ids == 1 then
             body[KINDS[k].field] = c.ids[1]
             used[#used + 1] = KINDS[k].label .. " " .. shown(k, c.ids[1])
+            if c.random then randoms[#randoms + 1] = KINDS[k].field end
         end
     end
     if n.numbers.finals then body.final_kills = n.numbers.finals; used[#used + 1] = n.numbers.finals .. " finals" end
     if n.numbers.beds then body.beds_broken = n.numbers.beds; used[#used + 1] = n.numbers.beds .. " beds" end
     if #used == 0 then return nil end
-    return body, used
+    return body, used, randoms
 end
 
 local startChecking
@@ -1233,6 +1286,7 @@ local function finishRun(r, text)
     if text then status(text) end
     run = nil
     cancel(nextTimer)
+    noteRun()
     starfish.timers.delay(500, function()
         if not run and #runs > 0 then run = table.remove(runs, 1); startChecking(run) end
     end)
@@ -1241,12 +1295,14 @@ end
 local function checkNext(r)
     r.nextAt = nil
     if run ~= r or r.state ~= "checking" then return end
-    if location.inGame then r.state = "paused"; status("§7Paused. Switch lobby to resume.") return end
+    if location.inGame then r.state = "paused"; status("§7Paused. Checks go on in the next lobby.") return end
     if r.index > #r.candidates then
-        finishRun(r, "§7No match for §c" .. r.nick .. "§7 (" .. #r.candidates .. " checked).")
+        finishRun(r, "§7None of the " .. #r.candidates .. " players were §c" .. r.nick .. "§7. Aurora may not have them.")
         return
     end
     local name = r.candidates[r.index]
+    noteRun()
+    pcall(starfish.chat.actionBar, "§7Checking §c" .. r.nick .. "§7: §f" .. r.index .. "/" .. #r.candidates)
     pending = { run = r, name = name, sentAt = now(), deadline = now() + MENU_WAIT_MS, windowId = nil, retries = r.retries or 0 }
     starfish.chat.sendToServer("/profile " .. name)
 end
@@ -1263,21 +1319,21 @@ menuTimeout = function(p)
         r.index = r.index - 2
         r.timeouts = 0
         r.state = "paused"
-        status("§e/profile isn't answering. Switch lobby to resume.")
+        status("§e/profile isn't answering. Checks go on in the next lobby.")
         return
     end
     r.unknown = r.unknown + 1
     r.index = r.index + 1
-    r.nextAt = now() + (starfish.config.get("profile.gap") or 1500)
-    nextTimer = starfish.timers.delay(starfish.config.get("profile.gap") or 1500, function() checkNext(r) end)
+    r.nextAt = now() + CHECK_GAP_MS
+    nextTimer = starfish.timers.delay(CHECK_GAP_MS, function() checkNext(r) end)
 end
 
 local function nextAfter(r)
     pending = nil
     r.index = r.index + 1
     r.retries = 0
-    r.nextAt = now() + (starfish.config.get("profile.gap") or 1500)
-    nextTimer = starfish.timers.delay(starfish.config.get("profile.gap") or 1500, function() checkNext(r) end)
+    r.nextAt = now() + CHECK_GAP_MS
+    nextTimer = starfish.timers.delay(CHECK_GAP_MS, function() checkNext(r) end)
 end
 
 startChecking = function(r)
@@ -1285,34 +1341,46 @@ startChecking = function(r)
     if not starfish.config.get("profile.enabled") then
         local list = {}
         for i = 1, math.min(10, #r.candidates) do list[i] = r.candidates[i] end
-        finishRun(r, "§7Candidates for §c" .. r.nick .. "§7: §f" .. table.concat(list, "§7, §f"))
+        finishRun(r, "§7Possible players for §c" .. r.nick .. "§7: §f" .. table.concat(list, "§7, §f"))
         return
     end
     if not isBlocked(r.nick) then
         awaitingBlock[lower(r.nick)] = r
         local list = {}
         for i = 1, math.min(10, #r.candidates) do list[i] = r.candidates[i] end
-        status("§7" .. r.nick .. " wasn't blocked in the game, so /profile can't check. Candidates: §f" .. table.concat(list, "§7, §f"))
+        status("§c" .. r.nick .. "§7 wasn't blocked in the game, so /profile can't confirm it. Possible players: §f" .. table.concat(list, "§7, §f"))
+        if not starfish.config.get("autoBlock.enabled") then
+            starfish.chat.sendToClient(starfish.text.of("§7Turn on Auto Block Nicks so the next ones can be checked. ")
+                .. component("§a[Turn On]", "§7Block nicks during games", "/cd autoblock on"))
+        end
         finishRun(r)
         return
     end
     if location.inGame or not location.inLobby then
         r.state = "paused"
-        status("§7" .. #r.candidates .. " to check for §c" .. r.nick .. "§7. Waiting for a lobby.")
+        status("§f" .. #r.candidates .. "§7 possible players for §c" .. r.nick .. "§7. They'll be checked with /profile in the next lobby.")
         return
     end
     r.state = "checking"
-    status("§7Checking " .. #r.candidates .. " for §c" .. r.nick .. "§7...")
+    status(component("§7Checking §f" .. #r.candidates .. "§7 players for §c" .. r.nick .. "§7...", "§7With /profile. Menus open and close by themselves."))
     checkNext(r)
 end
 
 local function finishMatch(r, real)
-    finishRun(r, "§c" .. r.nick .. " §7is §a" .. real .. " §8(/profile)")
+    finishRun(r, component("§c" .. r.nick .. " §7is §a" .. real .. "§7!", "§7Confirmed with /profile"))
+    pcall(function() starfish.client.world.playSound("random.levelup", { volume = 1, pitch = 1 }) end)
     foundByUs[lower(r.nick)] = real
     unsave(r.nick)
-    for _, g in pairs({ a = game, b = lastGame }) do
+    local games = {}
+    for _, g in ipairs({ game or false, lastGame or false }) do if g then games[#games + 1] = g end end
+    for _, g in ipairs(recentGames or {}) do games[#games + 1] = g end
+    for _, g in ipairs(games) do
         local n = g.nicks[lower(r.nick)]
-        if n then n.real = real end
+        if n then
+            n.real = real
+            -- Island cosmetics it shared with other nicks can now go to them.
+            if X then X.resolved(g, r.nick, real, function() resave(g) end) end
+        end
     end
     starfish.events.emit("cosmetic-denicker:resolved", { nickName = r.nick, realName = real })
     if starfish.config.get("profile.unblock") then
@@ -1325,20 +1393,41 @@ local function search(n, quiet)
     for _, r in ipairs(runs) do if lower(r.nick) == lower(n.name) then return end end
     local key = starfish.config.get("lookup.key")
     if not key or key == "" then
-        status("§cSet your Aurora key first: §f/cd key <key>")
+        starfish.chat.sendToClient(starfish.text.of("§cSet your Aurora key first. ") .. component("§f[/cd key]", "§7Paste your key after it", nil, "/cd key "))
         return
     end
-    local body, used = lookupBody(n)
+    local body, used, randoms = lookupBody(n)
     if not body then
         if not quiet then status("§7Not enough clues for §c" .. n.name .. "§7.") end
         return
     end
-    status("§7Searching §c" .. n.name .. "§7: §f" .. table.concat(used, "§7, §f"))
+    status(component("§7Searching §c" .. n.name .. "§7...", "§7Asking Aurora for:\n§f" .. table.concat(used, "\n§f")))
     -- Nobody found with everything: Aurora can be behind on a cosmetic, so
     -- the less certain ones are dropped one at a time.
+    -- Random is tried as "Random", then "Random favorite", then left out.
     local DROP = { "final_kills", "beds_broken", "activewoodtype", "activedeathcry", "activeglyph", "activevictorydance", "active_figurine", "activeislandtopper", "activenpcskin" }
+    for i = #randoms, 1, -1 do table.insert(DROP, 1, randoms[i]) end
+    local triedFavorite = false
+    local function favorite(b)
+        if triedFavorite or #randoms == 0 then return nil end
+        triedFavorite = true
+        local nb = {}
+        for k, v in pairs(b) do nb[k] = v == "random_cosmetic" and "random_favorite_cosmetic" or v end
+        return nb
+    end
+    local function withoutRandoms(b)
+        local nb, cut = {}, false
+        for k, v in pairs(b) do
+            if v == "random_cosmetic" or v == "random_favorite_cosmetic" then cut = true else nb[k] = v end
+        end
+        return cut and next(nb) and nb or nil
+    end
     local function ask(b)
         starfish.http.post(AURORA_URL .. "?key=" .. starfish.http.encodeUri(key), { body = b }, function(res)
+            if res.status == 422 then
+                local nb = withoutRandoms(b)
+                if nb then starfish.log.debug("Aurora: Random not accepted - asking without it") return ask(nb) end
+            end
             if not res.success or not res.data or type(res.data.data) ~= "table" then
                 local why = ({ [401] = "Aurora rejected the key.", [403] = "Aurora refused this key.", [404] = "nobody found.",
                     [422] = "Aurora couldn't use those values.", [429] = "rate limited, try later." })[res.status or 0]
@@ -1348,7 +1437,7 @@ local function search(n, quiet)
                 end
                 res.data = { data = {} }
             end
-            local max = starfish.config.get("lookup.max") or 20
+            local max = MAX_CANDIDATES
             local names, seen = {}, {}
             -- Aurora's stats can be behind, so an exact finals/beds match is rare:
             -- rank by how close their numbers are instead (never above the nick's).
@@ -1382,6 +1471,8 @@ local function search(n, quiet)
                 if name and not seen[lower(name)] and #names < max then seen[lower(name)] = true; names[#names + 1] = name end
             end
             if #names == 0 then
+                local fb = favorite(b)
+                if fb then starfish.log.debug("Aurora: nobody on Random - trying Random favorite") return ask(fb) end
                 local fields = 0
                 for _ in pairs(b) do fields = fields + 1 end
                 for _, f in ipairs(DROP) do
@@ -1645,12 +1736,12 @@ local function onProfileChat(text)
     elseif l:find("slow down") or l:find("too fast") or l:find("please wait") or l:find("cooldown") then
         pending = nil
         r.retries = (r.retries or 0) + 1
-        if r.retries > 2 then r.state = "paused"; status("§eHypixel says slow down - resuming next lobby.") return end
+        if r.retries > 2 then r.state = "paused"; status("§eHypixel says slow down. Checks go on in the next lobby.") return end
         nextTimer = starfish.timers.delay(5000, function() checkNext(r) end)
     elseif l:find("only use the social menu in lobbies") or l:find("can't use this here") then
         pending = nil
         r.state = "paused"
-        status("§7Not in a lobby - resuming next lobby.")
+        status("§7Checks go on in the next lobby.")
     end
 end
 
@@ -1665,10 +1756,9 @@ X = require("extras")({
 
 -- Chat in
 
-starfish.events.on("chat:receive", function(e)
-    if e.kind == "actionBar" then return end
-    local raw = e.message or ""
-    local text = plain(raw)
+-- Hypixel's "Blocked X." / "Unblocked X." for blocks this plugin sent are hidden.
+-- "Blocked X." / "Unblocked X.": keep the block list in step (true if it was one).
+local function onBlockLine(text)
     local blocked = text:match("^Blocked ([%w_]+)%.$")
     if blocked then
         setBlocked(blocked, true)
@@ -1679,8 +1769,30 @@ starfish.events.on("chat:receive", function(e)
             r.index, r.unknown, r.state, r.timeouts = 1, 0, "queued", 0
             if run then runs[#runs + 1] = r else run = r; startChecking(r) end
         end
-        return
+        return true
     end
+    local unblocked = text:match("^Unblocked ([%w_]+)%.$")
+    if unblocked then setBlocked(unblocked, false) return true end
+    return false
+end
+
+pcall(starfish.chat.onReceive, function(msg)
+    local text = plain(msg.legacy or "")
+    local verb, who = text:match("^(%a+) ([%w_]+)%.$")
+    local key = who and (verb == "Blocked" or verb == "Unblocked") and (lower(verb) .. " " .. lower(who))
+    local until_ = key and ownBlockReplies[key]
+    if until_ then
+        ownBlockReplies[key] = nil
+        onBlockLine(text) -- (a hidden line may not reach chat:receive)
+        if now() <= until_ then msg:cancel() end
+    end
+end, { receiveCancelled = true })
+
+starfish.events.on("chat:receive", function(e)
+    if e.kind == "actionBar" then return end
+    local raw = e.message or ""
+    local text = plain(raw)
+    if onBlockLine(text) then return end
     if lastBlockSend and now() - lastBlockSend.at < 3000 and not text:find(":", 1, true) then
         local l = lower(text)
         if (l:find("can't", 1, true) or l:find("cannot", 1, true) or l:find("couldn't", 1, true) or l:find("not find", 1, true)
@@ -1690,8 +1802,6 @@ starfish.events.on("chat:receive", function(e)
             lastBlockSend = nil
         end
     end
-    local unblocked = text:match("^Unblocked ([%w_]+)%.$")
-    if unblocked then setBlocked(unblocked, false) return end
     onProfileChat(text)
     if game and location.inGame then
         if not game.startAt and text:find("Protect your bed and destroy the enemy beds", 1, true) then X.start(game) end
@@ -1736,7 +1846,10 @@ local function endGame()
         local key = starfish.config.get("lookup.key")
         if next(g.nicks) and not starfish.config.get("hinted") and (not key or key == "" or not starfish.config.get("autoBlock.enabled")) then
             starfish.config.set("hinted", true)
-            starfish.chat.info("§7Cosmetic Denicker: set §f/cd key§7 and turn on Auto Block.")
+            local msg = starfish.text.of("§dCosmetic Denicker§7: to find who nicks are, set up ")
+            if not key or key == "" then msg = msg .. component("§f[Aurora Key]", "§7Paste your key after /cd key", nil, "/cd key ") .. starfish.text.of(" ") end
+            if not starfish.config.get("autoBlock.enabled") then msg = msg .. component("§a[Auto Block]", "§7Block nicks during games", "/cd autoblock on") end
+            starfish.chat.sendToClient(msg)
         end
         autoLookups(g)
         -- Only the nicks are needed from here on (once a dance has been judged).
@@ -1873,7 +1986,19 @@ starfish.commands.register("key", {
     arguments = { { name = "key", type = "string" } },
 }, function(ctx)
     starfish.config.set("lookup.key", ctx.args.key)
+    refreshSetup()
     return "§aAurora key saved."
+end)
+
+starfish.commands.register("autoblock", {
+    description = "Turn Auto Block Nicks on or off",
+    arguments = { { name = "state", type = "string", optional = true } },
+}, function(ctx)
+    local on = lower(ctx.args.state) ~= "off"
+    starfish.config.set("autoBlock.enabled", on)
+    refreshSetup()
+    if on and game and game.startAt then scanTab(game); autoBlock(game) end
+    return on and "§aAuto Block Nicks on." or "§7Auto Block Nicks off."
 end)
 
 starfish.commands.register("stop", {
@@ -1881,7 +2006,7 @@ starfish.commands.register("stop", {
 }, function()
     runs = {}
     pending = nil
-    if run then run = nil; cancel(nextTimer); return "§7Stopped." end
+    if run then run = nil; cancel(nextTimer); noteRun(); return "§7Stopped." end
     return "§7Nothing running."
 end)
 
