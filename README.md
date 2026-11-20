@@ -9,6 +9,7 @@ Beta. Spots nicked players' cosmetics and finds who they are after the game
 
 ## Commands
 
+- `/autoblock [state]`: Turn Auto Block Nicks on or off
 - `/clear [confirm]`: Remove all saved nicks
 - `/key <key>`: Set your Aurora API key
 - `/list`: Nicks in your last game
