@@ -1,7 +1,7 @@
 {
   "name": "cosmetic-denicker",
   "display_name": "Cosmetic Denicker",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Beta. Spots nicked players' cosmetics and finds who they are after the game",
   "prefix": "§dCD",
   "homepage": null,
@@ -18,6 +18,10 @@
     }
   ],
   "commands": [
+    {
+      "usage": "/autoblock [state]",
+      "description": "Turn Auto Block Nicks on or off"
+    },
     {
       "usage": "/clear [confirm]",
       "description": "Remove all saved nicks"
