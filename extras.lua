@@ -177,7 +177,7 @@ local function median(list)
     return list[math.floor(#list / 2) + 1]
 end
 
-local islandSoon
+local islandSoon, lastLeft
 
 local function islandHome(g, name, pos, how)
     if not name or not pos then return end
@@ -197,6 +197,38 @@ local function islandHome(g, name, pos, how)
     s.homes[key] = { pos = { x = pos.x, y = pos.y, z = pos.z }, how = how }
     log("island: %s spawns at %.0f,%.0f,%.0f (%s)", name, pos.x, pos.y, pos.z, how)
     islandSoon(g)
+end
+
+-- Far islands' players show up a second or two after the spawn points are
+-- read. Where one first appears then is their spawn, snapped to the nearest
+-- spot made by turning and mirroring the on-time spawns about 0,0 (they've
+-- had time to walk off it).
+local LATE_START_MS, LATE_SNAP = 6000, 10
+
+local function lateStart(g, name, pos)
+    local s = S(g)
+    if not name or not pos or not g.startAt or s.homes[lower(name)] then return end
+    if now() - g.startAt > LATE_START_MS then return end
+    if math.sqrt(pos.x * pos.x + pos.z * pos.z) < ISLAND_LOBBY_BLOCKS then return end
+    local hs = {}
+    for _, h in pairs(s.homes) do if h.how == "at the start" then hs[#hs + 1] = h.pos.y end end
+    local m = median(hs)
+    if m and math.abs(pos.y - m) > 4 then return end
+    local best
+    for _, h in pairs(s.homes) do
+        if h.how == "at the start" and not h.late then
+            local x, z = h.pos.x, h.pos.z
+            for _, c in ipairs({ { x, z }, { -x, z }, { x, -z }, { -x, -z }, { z, x }, { -z, x }, { z, -x }, { -z, -x } }) do
+                local d = math.sqrt((c[1] - pos.x) ^ 2 + (c[2] - pos.z) ^ 2)
+                if d <= LATE_SNAP and (not best or d < best.d) then best = { x = c[1], z = c[2], d = d } end
+            end
+        end
+    end
+    local at = best and { x = best.x, y = pos.y, z = best.z } or pos
+    if best then
+        for _, h in pairs(s.homes) do if flat(h.pos, at) < 4 then return end end -- (someone's already there)
+    end
+    if islandHome(g, name, at, "at the start") ~= false and s.homes[lower(name)] then s.homes[lower(name)].late = true end
 end
 
 local function readTeams(g)
@@ -446,14 +478,15 @@ local function islandField(cat, fields)
     return nil
 end
 
-local function checkTeam(ask)
+local function checkTeam(ask, done)
     local g, cat, ids = ask.g, ask.cat, ask.ids
     local uuids = {}
     for _, r in ipairs(ask.reals) do uuids[#uuids + 1] = r.uuid end
     hypixelFields(uuids, function(infos, err)
+        local function finish() if done then done() end end
         if err then
             for _, n in ipairs(ask.nicks) do C.addClue(g, n, cat, ids, false, "on their team's island - teammates not checked (" .. err .. ")") end
-            return
+            return finish()
         end
         local unsure = {}
         for _, r in ipairs(ask.reals) do
@@ -463,7 +496,7 @@ local function checkTeam(ask)
                 if has == id then
                     log("island: %s is %s's (Aurora) - not the nicks'", token(ids), r.name)
                     for _, n in ipairs(ask.nicks) do C.removeClue(g, n, cat, token(ids)) end
-                    return
+                    return finish()
                 end
             end
             if not info then unsure[#unsure + 1] = r.name .. " isn't on Aurora"
@@ -472,12 +505,14 @@ local function checkTeam(ask)
         end
         for _, n in ipairs(ask.nicks) do C.removeClue(g, n, cat, token(ids)) end
         if #unsure > 0 then
-            for _, n in ipairs(ask.nicks) do C.addClue(g, n, cat, ids, false, "on their team's island, but " .. table.concat(unsure, ", ")) end
+            -- Likely the teammate's: the nick gets nothing.
+            log("island: %s likely a teammate's (%s)", token(ids), table.concat(unsure, ", "))
         elseif #ask.nicks > 1 then
             for _, n in ipairs(ask.nicks) do C.addClue(g, n, cat, ids, false, "one of " .. table.concat(ask.nicks, ", ") .. " - can't tell which") end
         else
             islandAdd(g, ask.nicks[1], cat, table.concat(ids, ","), "their team's island, not a teammate's")
         end
+        finish()
     end)
 end
 
@@ -562,6 +597,7 @@ local function judge(g)
     if not g.startAt or g.overAt then return end
     local s = S(g)
     readTeams(g)
+    lastLeft(g)
     local t0 = now()
     local again = false
     local found, mobs = {}, {}
@@ -786,6 +822,124 @@ local function buildToppers(g)
     islandSoon(g)
 end
 
+-- Far islands: their players aren't seen at the start, but beds are placed
+-- just after it all over the map. When one breaks, the "Yellow Bed was
+-- destroyed" line says whose island it is.
+local BED_MATCH_MS = 3000
+local BED_CODES = { red = "c", blue = "9", green = "a", yellow = "e", aqua = "b", white = "f", pink = "d", gray = "7", grey = "7" }
+
+-- Scoreboard team colour code -> its players (lowercase) still in this game.
+local function teamsByCode(g)
+    local s = S(g)
+    local inTab = {}
+    for _, n in pairs(s.byUuid) do inTab[lower(n)] = true end
+    local out = {}
+    local ok, teams = pcall(starfish.scoreboard.teams)
+    if not ok or type(teams) ~= "table" then return out end
+    for _, t in ipairs(teams) do
+        local code = tostring(t.prefix or ""):match("§(%x)")
+        if code then
+            code = code:lower()
+            for _, n in ipairs(t.players or {}) do
+                local l = lower(n)
+                if inTab[l] then
+                    out[code] = out[code] or {}
+                    local dup = false
+                    for _, x in ipairs(out[code]) do if x == l then dup = true end end
+                    if not dup then out[code][#out[code] + 1] = l end
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function bedPos(b) return { x = b.x + 0.5, y = b.y, z = b.z + 0.5 } end
+
+local function placeTeam(g, team, pos, how)
+    local s = S(g)
+    for _, n in ipairs(team) do
+        local h = s.homes[n]
+        if h and flat(h.pos, pos) > ISLAND_NEAR + 4 then log("island: %s spawns far from %s - not used", n, how) return end
+    end
+    for _, n in ipairs(team) do if not s.homes[n] then islandHome(g, n, pos, how) end end
+end
+
+-- Every island but one known, and every team but one placed: the last is theirs.
+lastLeft = function(g)
+    local s = S(g)
+    if s.lastLeftDone or not s.beds or #s.beds == 0 then return end
+    local codes, count = teamsByCode(g), 0
+    for _ in pairs(codes) do count = count + 1 end
+    if count < 2 or #s.beds ~= count then return end
+    local owned, unknown = {}, {}
+    for _, b in ipairs(s.beds) do
+        local who
+        for code, players in pairs(codes) do
+            for _, p in ipairs(players) do
+                local h = s.homes[p]
+                if h and flat(h.pos, bedPos(b)) <= ISLAND_NEAR + 4 then who = code end
+            end
+        end
+        if who then owned[who] = true else unknown[#unknown + 1] = b end
+    end
+    local missing = {}
+    for code in pairs(codes) do if not owned[code] then missing[#missing + 1] = code end end
+    if #unknown ~= 1 or #missing ~= 1 then return end
+    s.lastLeftDone = true
+    placeTeam(g, codes[missing[1]], bedPos(unknown[1]), "the last island left")
+end
+
+local function bedMatch(g)
+    local s = S(g)
+    for _, ln in ipairs(s.bedLines or {}) do
+        if not ln.done then
+            local gone = {}
+            for _, b in ipairs(s.beds or {}) do
+                if b.gone and not b.used and math.abs(b.gone - ln.at) <= BED_MATCH_MS then gone[#gone + 1] = b end
+            end
+            if #gone ~= 1 then
+                if now() - ln.at > BED_MATCH_MS then ln.done = true end
+            else
+                ln.done = true
+                gone[1].used = true
+                if not ln.own then
+                    local team = ln.code and teamsByCode(g)[ln.code]
+                    if team and #team > 0 then placeTeam(g, team, bedPos(gone[1]), "their bed")
+                    else log("island: %s bed broken - team unknown", ln.word) end
+                end
+            end
+        end
+    end
+    lastLeft(g)
+end
+
+local function onBedBlock(g, x, y, z, id)
+    local s = S(g)
+    s.beds = s.beds or {}
+    local since = now() - g.startAt
+    if id == 26 then
+        if since > TOPPER_WATCH_MS then return end
+        for _, b in ipairs(s.beds) do
+            if b.y == y and math.abs(b.x - x) + math.abs(b.z - z) <= 1 then
+                for _, p in ipairs(b.parts) do if p.x == x and p.z == z then return end end
+                b.parts[#b.parts + 1] = { x = x, y = y, z = z }
+                return
+            end
+        end
+        if #s.beds < 16 then s.beds[#s.beds + 1] = { x = x, y = y, z = z, parts = { { x = x, y = y, z = z } } } end
+        return
+    end
+    if since <= TOPPER_WATCH_MS then return end
+    for _, b in ipairs(s.beds) do
+        if not b.gone then
+            for _, p in ipairs(b.parts) do
+                if p.x == x and p.y == y and p.z == z then b.gone = now(); bedMatch(g); return end
+            end
+        end
+    end
+end
+
 -- Game start / over / kills (called by init.lua)
 
 local X = {}
@@ -853,6 +1007,44 @@ function X.kill(g, ev, victim, final)
     if final then s.finalDied[lower(victim)] = now() end
     ev.victim = victim
     for _, cry in ipairs(s.cries) do cryMatch(g, cry) end
+end
+
+function X.bedLine(g, line)
+    local word = line:match("^BED DESTRUCTION > (%a+) Bed")
+    if not word or not g.startAt then return end
+    local s = S(g)
+    s.bedLines = s.bedLines or {}
+    local own = lower(word) == "your"
+    s.bedLines[#s.bedLines + 1] = { word = word, own = own, code = BED_CODES[lower(word)], at = now() }
+    if #s.bedLines > 20 then
+        local keep = {}
+        for _, l in ipairs(s.bedLines) do if not l.done then keep[#keep + 1] = l end end
+        s.bedLines = keep
+    end
+    bedMatch(g)
+    -- (The bed's blocks can come just after the line.)
+    starfish.timers.delay(BED_MATCH_MS + 100, function() if C.game() == g then bedMatch(g) end end)
+end
+
+-- A nick found later: redo the island checks it shared with other nicks.
+function X.resolved(g, nick, real, done)
+    local s = g.x
+    if not s then return end
+    local hit = {}
+    for _, a in ipairs(s.asks) do
+        for i, n in ipairs(a.nicks) do
+            if lower(n) == lower(nick) then table.remove(a.nicks, i); hit[#hit + 1] = a; break end
+        end
+    end
+    if #hit == 0 then return end
+    starfish.http.get("https://api.mojang.com/users/profiles/minecraft/" .. real, {}, function(res)
+        local id = res and res.success and type(res.data) == "table" and res.data.id
+        for _, a in ipairs(hit) do
+            C.removeClue(g, nick, a.cat, token(a.ids))
+            a.reals[#a.reals + 1] = { name = nick, uuid = id and ukey(id) or ("unknown-" .. nick) }
+            if #a.nicks > 0 then checkTeam(a, done) end
+        end
+    end)
 end
 
 function X.over(g)
@@ -939,6 +1131,7 @@ starfish.events.on("entity:spawn", function(e)
         -- A player reappearing just after dying has respawned at home.
         local name = nameOfUuid(g, uuid)
         local s = S(g)
+        lateStart(g, name, pos)
         local died = name and s.died[lower(name)]
         if died then
             local since = now() - died
@@ -1052,6 +1245,7 @@ starfish.events.on("world:blockChange", function(e)
         if id ~= 0 then C.tally("block", tostring(id), { x = e.x + 0.5, y = e.y, z = e.z + 0.5 }, 1) end
         return
     end
+    onBedBlock(g, e.x, e.y, e.z, id)
     local at = now() - g.startAt
     local list = S(g).startBlocks
     if at <= TOPPER_WATCH_MS and #list < 20000 then list[#list + 1] = { x = e.x, y = e.y, z = e.z, id = id, m = m, at = at } end
